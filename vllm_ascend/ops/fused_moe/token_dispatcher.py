@@ -52,6 +52,64 @@ from vllm_ascend.utils import (
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
 
+# [MOE-MASK-RANGE] begin ------------------------------------------------------
+import os as _os_mask_range
+
+# When V41_MOE_MASK_RANGE=1 and expert_map is the standard contiguous EP
+# mapping (local experts form one range), `expert_map[topk_ids] != -1` can be
+# replaced by a range compare, dropping the aclnnIndex + IndexCheck kernels.
+# The masked weights keep their semantics: expanded_row_idx may contain -1 so
+# unpermute reads unwritten rows that must carry zero weight.
+_MOE_MASK_RANGE_FAST = _os_mask_range.environ.get("V41_MOE_MASK_RANGE", "0") == "1"
+_MOE_MASK_RANGE_CACHE: dict = {}
+
+
+def _eplb_is_off() -> bool:
+    """EPLB (incl. dynamic EPLB) reorders expert_map; range compare is invalid."""
+    try:
+        eplb = getattr(get_ascend_config(), "eplb_config", None)
+        if eplb is None:
+            return True
+        for _name in ("dynamic_eplb", "enable_eplb"):
+            if bool(getattr(eplb, _name, False)):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _expert_map_is_contiguous_range(expert_map, first_expert_idx: int, last_expert_idx: int) -> bool:
+    """One-shot host check: is expert_map exactly local=[first, last)?"""
+    try:
+        _m = expert_map.detach().to("cpu", torch.int32).reshape(-1)
+        if _m.numel() < int(last_expert_idx):
+            return False
+        _expect = torch.full_like(_m, -1)
+        _expect[first_expert_idx:last_expert_idx] = torch.arange(
+            last_expert_idx - first_expert_idx, dtype=torch.int32
+        )
+        return bool(torch.equal(_m, _expect))
+    except Exception:
+        return False
+
+
+def _is_contiguous_local_range(expert_map, first_expert_idx: int, last_expert_idx: int) -> bool:
+    """Hot-path entry: EPLB off + one-time (first, last, E) content check.
+
+    expert_map layout is a (rank, EP/EPLB config) level property: all layers
+    share (first, last, E) under one config, so validate once and cache.
+    """
+    if not _eplb_is_off():
+        return False
+    _key = (int(first_expert_idx), int(last_expert_idx), int(expert_map.numel()))
+    _cached = _MOE_MASK_RANGE_CACHE.get(_key)
+    if _cached is not None:
+        return _cached
+    _ok = _expert_map_is_contiguous_range(expert_map, first_expert_idx, last_expert_idx)
+    _MOE_MASK_RANGE_CACHE[_key] = _ok
+    return _ok
+# [MOE-MASK-RANGE] end --------------------------------------------------------
+
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
     # grouped_matmul_swiglu_quant_v2 consumes per-expert counts; existing
@@ -390,10 +448,18 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
             global_num_experts = len(expert_map) + global_redundant_expert_num
-            mask = expert_map[topk_ids] != -1
-            topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
             last_expert_idx = first_expert_idx + self.num_experts_local
+            # [MOE-MASK-RANGE] With a contiguous-range expert_map the gather
+            # compare is equivalent to a range compare; the zeroed weights
+            # keep unpermute semantics for unwritten rows.
+            if _MOE_MASK_RANGE_FAST and _is_contiguous_local_range(expert_map, first_expert_idx, last_expert_idx):
+                topk_weights = topk_weights.masked_fill(
+                    (topk_ids < first_expert_idx) | (topk_ids >= last_expert_idx), 0.0
+                )
+            else:
+                mask = expert_map[topk_ids] != -1
+                topk_weights = topk_weights * mask
         else:
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local

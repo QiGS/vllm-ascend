@@ -9,6 +9,27 @@ from vllm.platforms import current_platform
 
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+# [ROPE-IDXSEL] begin ---------------------------------------------------------
+import os as _os_rope_idxsel
+
+# When V41_ROPE_IDXSEL=1, replace `src[pos_tensor]` (Index + IndexCheck, two
+# kernels) with a single index_select (GatherV3) for the cos/sin table lookup.
+_ROPE_IDXSEL = _os_rope_idxsel.environ.get("V41_ROPE_IDXSEL", "0") == "1"
+
+
+def _rope_1d_index(pos_tensor):
+    """Normalize positions to a 1-D int64 index (no kernel if already int64)."""
+    idx = pos_tensor.reshape(-1)
+    if idx.dtype != torch.int64:
+        idx = idx.to(torch.int64)
+    return idx
+
+
+def _rope_indexed(src, pos_tensor):
+    """Equivalent to src[pos_tensor] with a single GatherV3 kernel."""
+    return torch.index_select(src, 0, _rope_1d_index(pos_tensor))
+# [ROPE-IDXSEL] end -----------------------------------------------------------
+
 
 def inplace_partial_rotary_mul(
     x: torch.Tensor,
@@ -124,8 +145,14 @@ def get_cos_and_sin_dsa(
             if group_name not in registered_groups:
                 continue
 
-            curr_cos = full_rope_cos[pos_tensor]
-            curr_sin = full_rope_sin[pos_tensor]
+            # [ROPE-IDXSEL] src[pos_tensor] -> index_select: Index+IndexCheck
+            # collapse into one GatherV3 kernel (bit-identical results).
+            if _ROPE_IDXSEL and pos_tensor.dim() == 1:
+                curr_cos = _rope_indexed(full_rope_cos, pos_tensor)
+                curr_sin = _rope_indexed(full_rope_sin, pos_tensor)
+            else:
+                curr_cos = full_rope_cos[pos_tensor]
+                curr_sin = full_rope_sin[pos_tensor]
 
             if use_cache:
                 group_buffers = (
